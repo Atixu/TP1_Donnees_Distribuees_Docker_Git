@@ -148,6 +148,65 @@ node-3 : 9 cryptos
 
 Les données ne sont gardées qu'en mémoire, donc le nœud 2 redémarre **vide**. Son thread de synchronisation interroge un pair toutes les 2 s (`GET /internal/data`) et récupère tout son état. Il obtient ainsi **Avalanche**, la donnée écrite pendant son absence, sans aucune intervention.
 
+## Questions
+
+### Quel est le rôle de chaque nœud dans l'architecture ?
+
+| Nœud | Conteneur | Port hôte | Rôle |
+|---|---|---|---|
+| Leader | `replication-node-1` | 8080 | Reçoit les écritures du client (`inject-crypto.py`, `curl`). Il stocke chaque crypto puis la **propage** aux deux autres nœuds (`POST /internal/replicate`). |
+| Follower 1 | `replication-node-2` | 8081 | Garde une **copie** des données. C'est le nœud qu'on arrête : en revenant, il se resynchronise auprès d'un pair (`GET /internal/data`). |
+| Follower 2 | `replication-node-3` | 8082 | Garde une autre **copie**. Pendant la panne du follower 1, il continue de recevoir les écritures, donc il reste au moins 2 copies à jour. |
+
+Dans ce code, les trois nœuds exécutent la même application. Le nœud 1 n'est « Leader » que parce que le client lui envoie toutes les écritures. Une écriture envoyée sur 8081 ou 8082 serait elle aussi répliquée. Chaque nœud peut répondre aux lectures (`GET /data`), ce qui assure la disponibilité si un nœud tombe.
+
+### Comment Docker permet-il au Leader de retrouver node-follower-1 ?
+
+Grâce au **DNS interne de Docker**. Les conteneurs sont tous reliés au même réseau bridge défini par l'utilisateur (`distributed-net`). Sur ce type de réseau, Docker fournit un serveur DNS (`127.0.0.11`) qui associe chaque **nom de conteneur ou de service** à son adresse IP sur le réseau :
+
+```text
+$ docker exec replication-node-1 cat /etc/resolv.conf
+nameserver 127.0.0.11
+
+$ docker exec replication-node-1 python -c "import socket; print(socket.gethostbyname('replication-node-2'))"
+172.21.0.2
+```
+
+Le Leader connaît donc ses pairs par leur nom, avec la variable `PEERS=http://replication-node-2:8080,http://replication-node-3:8080` du `docker-compose.yml`, et jamais par leur IP. C'est important parce que l'IP peut changer quand le conteneur est recréé (`docker rm -f` puis `docker compose up`), alors que le nom reste le même. Le réseau par défaut `bridge` n'offre pas cette résolution par nom, d'où la création préalable de `distributed-net`.
+
+Avec le nom de l'architecture Leader/Follower du TP1, le principe est le même : le Leader joint `http://node-follower-1:8080`, et Docker traduit `node-follower-1` en IP.
+
+### Pourquoi la communication réseau devient-elle importante dans une architecture distribuée ?
+
+Les nœuds ne partagent ni mémoire ni disque. **Le réseau est leur seul moyen d'échanger des données**. Toutes les fonctions du projet en dépendent :
+
+- **Réplication** : une écriture n'existe sur les followers que si l'appel HTTP du Leader aboutit.
+- **Détection de panne** : le Leader ne « sait » qu'un nœud est tombé que parce que l'appel réseau échoue (`UNAVAILABLE: URLError`).
+- **Resynchronisation** : le follower revenu récupère son retard en interrogeant un pair sur le réseau.
+- **Cohérence** : tant qu'un message n'est pas arrivé, les copies divergent. Le follower 1 n'avait pas Avalanche pendant sa panne.
+
+Le réseau introduit aussi des problèmes qui n'existent pas sur une seule machine : **latence**, **messages perdus**, **timeouts** (ici 1,5 s par pair), nœuds injoignables, partitions réseau. Une architecture distribuée doit être conçue en sachant que le réseau peut tomber en panne. C'est l'hypothèse de départ du théorème CAP.
+
+### Quelle différence avec une application utilisant uniquement localhost ?
+
+`localhost` (127.0.0.1) désigne **la machine ou le conteneur lui-même**. Dans Docker, chaque conteneur a son propre espace réseau, donc son propre `localhost`. Depuis le Leader, `localhost:8081` ne mène pas au follower 1 :
+
+```text
+$ docker exec replication-node-1 python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"
+urllib.error.URLError: <urlopen error [Errno 111] Connection refused>
+```
+
+| Application en localhost | Application distribuée (ce projet) |
+|---|---|
+| Un seul processus ou une seule machine, les composants se parlent localement | Plusieurs nœuds isolés qui se parlent à travers un réseau |
+| Adresse fixe `127.0.0.1` | Noms de service résolus par DNS (`replication-node-2`) |
+| Si la machine tombe, tout s'arrête (point de défaillance unique) | Si un nœud tombe, les autres continuent de servir |
+| Une seule copie des données | Plusieurs copies répliquées |
+| Pas de latence ni de perte réseau à gérer | Il faut gérer les timeouts, les pannes et la cohérence entre les copies |
+| Montée en charge limitée à une machine | Montée en charge possible en ajoutant des nœuds |
+
+`localhost` reste utilisé dans ce projet, mais uniquement **depuis la machine hôte** : `localhost:8080/8081/8082` passe par les ports publiés par Docker (`ports:` dans le compose). Entre eux, les nœuds communiquent uniquement par leur nom sur `distributed-net`.
+
 ## Conclusion
 
 - **Réplication** : chaque cours injecté existe en 3 copies, une par nœud.
